@@ -1,0 +1,60 @@
+name: sync
+
+on:
+  workflow_dispatch:
+    inputs:
+      total_shards:
+        required: true
+        default: "10"
+      skip_last_shard:
+        required: false
+        default: "false"
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -q requests cryptography
+      - run: python fetch.py collect --out-dir build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: index
+          path: build/
+      - id: m
+        env:
+          TOTAL: ${{ github.event.inputs.total_shards }}
+          SKIP: ${{ github.event.inputs.skip_last_shard }}
+        run: echo "matrix=$(python -c 'import json,os; n=int(os.environ["TOTAL"]); print(json.dumps(list(range(n-1 if os.environ.get("SKIP")=="true" else n))))')" >> "$GITHUB_OUTPUT"
+
+  work:
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        shard: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -q requests cryptography
+      - uses: actions/download-artifact@v4
+        with:
+          name: index
+          path: build
+      - run: >
+          python fetch.py pull --in-dir build --out-dir parts
+          --shard ${{ matrix.shard }} --total ${{ github.event.inputs.total_shards }}
+          --key key_public.pem
+      - uses: actions/upload-artifact@v4
+        with:
+          name: part-${{ matrix.shard }}
+          path: parts/
