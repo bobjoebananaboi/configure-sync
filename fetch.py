@@ -85,8 +85,9 @@ def _page(sess, cid, pg):
     return _post(sess, q)["products"]
 
 
-def _one(sess, key):
+def _one(sess, key, stats):
     url = _BASE + "/rest/default/V1/availability/" + key
+    saw = False
     for i in range(3):
         try:
             _LIM.take()
@@ -94,6 +95,9 @@ def _one(sess, key):
             if r.status_code == 404:
                 return {}
             if r.status_code == 429:
+                saw = True
+                with stats["lock"]:
+                    stats["rl"] += 1
                 time.sleep(5 * (i + 1))
                 continue
             r.raise_for_status()
@@ -104,6 +108,9 @@ def _one(sess, key):
             return out
         except requests.RequestException:
             time.sleep(2 * (i + 1))
+    if saw:
+        with stats["lock"]:
+            stats["unresolved"].append(key)
     return {}
 
 
@@ -140,21 +147,25 @@ def pull(in_dir, out_dir, shard, total, pub, workers=5):
     ids = json.loads((Path(in_dir) / "ids.json").read_text())
     mine = [x for x in ids if zlib.crc32(x.encode("utf-8")) % total == shard]
     print("part", shard, "of", total, ":", len(mine))
+    stats = {"lock": threading.Lock(), "rl": 0, "unresolved": []}
     res = {}
     with requests.Session() as s:
         s.headers.update(_UA)
         with ThreadPoolExecutor(max_workers=workers) as ex:
-            fut = {ex.submit(_one, s, x): x for x in mine}
+            fut = {ex.submit(_one, s, x, stats): x for x in mine}
             for f in as_completed(fut):
                 res[fut[f]] = f.result()
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps(res).encode("utf-8")
+    # The failed-id list rides inside the encrypted payload, so the public log
+    # never shows which ids (or the address); only the counts are printed here.
+    obj = {"items": res, "diag": {"rl": stats["rl"], "unresolved": stats["unresolved"]}}
+    payload = json.dumps(obj).encode("utf-8")
     if pub:
         payload = _lock(Path(pub).read_bytes(), payload)
     p = out / ("part_%d.json" % shard)
     p.write_bytes(payload)
-    print("wrote", p)
+    print("part", shard, "done:", len(res), "ids,", stats["rl"], "backoffs,", len(stats["unresolved"]), "unresolved")
 
 
 if __name__ == "__main__":
