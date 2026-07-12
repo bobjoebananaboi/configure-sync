@@ -1,6 +1,8 @@
 import argparse
 import base64
+import gzip
 import json
+import os
 import threading
 import time
 import zlib
@@ -112,7 +114,7 @@ def _groups(sess):
 
 
 def _page(sess, cid, pg):
-    q = '{ products(filter:{category_id:{eq:"%s"}},pageSize:%d,currentPage:%d){page_info{total_pages} items{id sku stock_status}} }' % (cid, _PAGE, pg)
+    q = '{ products(filter:{category_id:{eq:"%s"}},pageSize:%d,currentPage:%d){page_info{total_pages} items{sku stock_status}} }' % (cid, _PAGE, pg)
     return _post(sess, q)["products"]
 
 
@@ -202,14 +204,20 @@ def _lock(pub_pem, data):
     return json.dumps({"v": 1, "key": base64.b64encode(wk).decode("ascii"), "data": base64.b64encode(tok).decode("ascii")}).encode("utf-8")
 
 
-def collect(out_dir, mode="availability"):
-    """mode "availability": ids.json = sorted in-stock skus (existing behavior).
-    mode "nla": ids.json = sorted [sku, id] pairs for currently out-of-stock
-    products (the HTML pass needs the numeric id, not the sku, for its URL)."""
+def collect(out_dir):
+    """Crawl the catalog and write the in-stock SKU list (availability mode
+    only). NOT usable to discover an "out-of-stock" list: Magento's category
+    browse only ever returns sellable (stock_status IN_STOCK) items - live
+    testing found 100% of ~29k sampled catalog items came back IN_STOCK, with
+    zero exceptions. The real "Out of Stock" state only exists after the
+    per-location availability sweep finds zero quantity everywhere (see
+    compute_stock_status in the site scraper's stock-status module), so it can't be
+    rediscovered by a fresh crawl - the NLA pass instead gets its target list
+    handed to it via decode_nla(), sourced from the app's own already-computed
+    CSV."""
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     in_stock = set()
-    oos = {}
     with requests.Session() as s:
         s.headers.update(_UA)
         for cid in _groups(s):
@@ -219,14 +227,24 @@ def collect(out_dir, mode="availability"):
                 for it in pd["items"]:
                     if it.get("stock_status") == "IN_STOCK":
                         in_stock.add(it["sku"])
-                    elif it.get("id"):
-                        oos[it["sku"]] = it["id"]
-    if mode == "nla":
-        (out / "ids.json").write_text(json.dumps(sorted(oos.items())))
-        print("collected", len(oos), "out-of-stock product(s)")
-    else:
-        (out / "ids.json").write_text(json.dumps(sorted(in_stock)))
-        print("collected", len(in_stock))
+    (out / "ids.json").write_text(json.dumps(sorted(in_stock)))
+    print("collected", len(in_stock))
+
+
+NLA_SECRET_SLOTS = 5
+
+
+def decode_nla(out_dir):
+    """NLA mode's "collect" equivalent: reconstruct the out-of-stock product
+    id list from the NLA_TARGETS_0..4 repo secrets (set by the app just before
+    dispatch - see the app's target-push helper), rather than crawling.
+    Secrets are gzip+base64 chunks concatenated in slot order."""
+    b64 = "".join(os.environ.get(f"NLA_TARGETS_{i}", "") for i in range(NLA_SECRET_SLOTS))
+    ids = json.loads(gzip.decompress(base64.b64decode(b64))) if b64 else []
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "ids.json").write_text(json.dumps(ids))
+    print("decoded", len(ids), "out-of-stock product id(s) from secrets")
 
 
 def pull(in_dir, out_dir, shard, total, pub, workers=5, mode="availability"):
@@ -236,14 +254,14 @@ def pull(in_dir, out_dir, shard, total, pub, workers=5, mode="availability"):
     with requests.Session() as s:
         s.headers.update(_UA)
         if mode == "nla":
-            mine = [(sku, pid) for sku, pid in raw if zlib.crc32(sku.encode("utf-8")) % total == shard]
+            mine = [pid for pid in raw if zlib.crc32(str(pid).encode("utf-8")) % total == shard]
             print("part", shard, "of", total, ":", len(mine))
             with ThreadPoolExecutor(max_workers=workers) as ex:
-                fut = {ex.submit(_one_nla, s, pid, stats): sku for sku, pid in mine}
+                fut = {ex.submit(_one_nla, s, pid, stats): pid for pid in mine}
                 for f in as_completed(fut):
-                    sku = fut[f]
+                    pid = fut[f]
                     if f.result():
-                        res[sku] = True
+                        res[str(pid)] = True
         else:
             mine = [x for x in raw if zlib.crc32(x.encode("utf-8")) % total == shard]
             print("part", shard, "of", total, ":", len(mine))
@@ -281,7 +299,8 @@ if __name__ == "__main__":
     sub = ap.add_subparsers(dest="stage", required=True)
     a = sub.add_parser("collect")
     a.add_argument("--out-dir", default="build")
-    a.add_argument("--mode", default="availability", choices=["availability", "nla"])
+    c = sub.add_parser("decode-nla")
+    c.add_argument("--out-dir", default="build")
     b = sub.add_parser("pull")
     b.add_argument("--in-dir", default="build")
     b.add_argument("--out-dir", default="parts")
@@ -292,6 +311,8 @@ if __name__ == "__main__":
     b.add_argument("--mode", default="availability", choices=["availability", "nla"])
     args = ap.parse_args()
     if args.stage == "collect":
-        collect(args.out_dir, mode=args.mode)
+        collect(args.out_dir)
+    elif args.stage == "decode-nla":
+        decode_nla(args.out_dir)
     else:
         pull(args.in_dir, args.out_dir, args.shard, args.total, args.key, args.workers, mode=args.mode)

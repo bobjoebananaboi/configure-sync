@@ -24,7 +24,18 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -q requests cryptography beautifulsoup4
-      - run: python fetch.py collect --out-dir build --mode ${{ github.event.inputs.mode }}
+      - name: Crawl catalog + build SKU list
+        if: ${{ github.event.inputs.mode != 'nla' }}
+        run: python fetch.py collect --out-dir build
+      - name: Decode NLA target list from secrets
+        if: ${{ github.event.inputs.mode == 'nla' }}
+        env:
+          NLA_TARGETS_0: ${{ secrets.NLA_TARGETS_0 }}
+          NLA_TARGETS_1: ${{ secrets.NLA_TARGETS_1 }}
+          NLA_TARGETS_2: ${{ secrets.NLA_TARGETS_2 }}
+          NLA_TARGETS_3: ${{ secrets.NLA_TARGETS_3 }}
+          NLA_TARGETS_4: ${{ secrets.NLA_TARGETS_4 }}
+        run: python fetch.py decode-nla --out-dir build
       - uses: actions/upload-artifact@v4
         with:
           name: index
