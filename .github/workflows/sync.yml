@@ -29,8 +29,10 @@ jobs:
       - id: m
         env:
           TOTAL: ${{ github.event.inputs.total_shards }}
-          SKIP: ${{ github.event.inputs.skip_last_shard }}
-        run: echo "matrix=$(python -c 'import json,os; n=int(os.environ["TOTAL"]); print(json.dumps(list(range(n-1 if os.environ.get("SKIP")=="true" else n))))')" >> "$GITHUB_OUTPUT"
+        # Always spawn all `total_shards` work jobs - skip_last_shard only
+        # controls whether the (unused-by-the-app) merge job runs below, it
+        # does NOT reserve a shard for the caller anymore.
+        run: echo "matrix=$(python -c 'import json,os; print(json.dumps(list(range(int(os.environ["TOTAL"])))))')" >> "$GITHUB_OUTPUT"
 
   work:
     needs: prepare
