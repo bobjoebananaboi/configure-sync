@@ -21,15 +21,29 @@ _ROOT = "2"
 _SKIP = {"5", "3", "4", "4052"}
 _MAXC = 9500
 _PAGE = 100
-_CAP = 200
 _WIN = 120.0
+_BUDGET = 190
+_BURST = 10
+_MIN_BUDGET = 60
+_STEP = 10
+_COOLDOWN = 140.0
 
 
 class _Bucket:
-    def __init__(self, cap, win):
-        self.cap = cap
-        self.rate = cap / win
-        self.t = float(cap)
+    """Small-burst rate limiter with adaptive backoff (matches the local
+    scraper's AdaptiveRateLimiter). Starts with a tiny burst rather than a full
+    window's worth, and on a 429 pauses everything + steps the budget down."""
+
+    def __init__(self, budget, win, burst, min_budget, step, cooldown):
+        self.win = win
+        self.burst = burst
+        self.min_budget = min_budget
+        self.step = step
+        self.cooldown = cooldown
+        self.budget = budget
+        self.rate = budget / win
+        self.t = float(burst)
+        self.blocked_until = 0.0
         self.lock = threading.Lock()
         self.last = time.monotonic()
 
@@ -37,16 +51,31 @@ class _Bucket:
         while True:
             with self.lock:
                 now = time.monotonic()
-                self.t = min(self.cap, self.t + (now - self.last) * self.rate)
-                self.last = now
-                if self.t >= 1:
-                    self.t -= 1
-                    return
-                wait = (1 - self.t) / self.rate
-            time.sleep(wait)
+                if now >= self.blocked_until:
+                    self.t = min(self.burst, self.t + (now - self.last) * self.rate)
+                    self.last = now
+                    if self.t >= 1:
+                        self.t -= 1
+                        return
+                    wait = (1 - self.t) / self.rate
+                else:
+                    wait = self.blocked_until - now
+            time.sleep(min(wait, 5.0))
+
+    def on_429(self):
+        with self.lock:
+            now = time.monotonic()
+            if now < self.blocked_until:
+                return False
+            self.blocked_until = now + self.cooldown
+            self.t = 0.0
+            self.last = now
+            self.budget = max(self.min_budget, self.budget - self.step)
+            self.rate = self.budget / self.win
+            return True
 
 
-_LIM = _Bucket(_CAP, _WIN)
+_LIM = _Bucket(_BUDGET, _WIN, _BURST, _MIN_BUDGET, _STEP, _COOLDOWN)
 
 
 def _post(sess, q, tries=4):
@@ -56,7 +85,8 @@ def _post(sess, q, tries=4):
             _LIM.take()
             r = sess.post(_GQL, data=json.dumps({"query": q}), timeout=30)
             if r.status_code == 429:
-                time.sleep(5 * (i + 1))
+                if _LIM.on_429():
+                    print("  429 - cooling down, budget now", _LIM.budget)
                 continue
             r.raise_for_status()
             p = json.loads(r.content.decode("utf-8"))
@@ -98,7 +128,7 @@ def _one(sess, key, stats):
                 saw = True
                 with stats["lock"]:
                     stats["rl"] += 1
-                time.sleep(5 * (i + 1))
+                _LIM.on_429()
                 continue
             r.raise_for_status()
             out = {}
