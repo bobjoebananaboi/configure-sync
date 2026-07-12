@@ -148,9 +148,15 @@ def _one(sess, key, stats):
 def _one_nla(sess, product_id, stats):
     """Fetch a product's view-by-id page and report whether its stock badge
     reads "No Longer Available" (mirrors the local scraper's fetch_stock_badge,
-    but boolean-only since only positives are worth shipping back)."""
+    but boolean-only since only positives are worth shipping back).
+
+    Tracks non-429 failures (bad status, no badge element, request errors)
+    separately from rate-limit backoffs - the old version only ever counted
+    429s, so a persistent block/error (e.g. a non-429 status specific to
+    datacenter IPs) silently retried 3x and returned False with zero
+    diagnostic trace, indistinguishable from "genuinely not flagged"."""
     url = _BASE + "/catalog/product/view/id/" + str(product_id)
-    saw = False
+    saw_429 = False
     for i in range(3):
         try:
             _LIM.take()
@@ -158,18 +164,27 @@ def _one_nla(sess, product_id, stats):
             if r.status_code == 404:
                 return False
             if r.status_code == 429:
-                saw = True
+                saw_429 = True
                 with stats["lock"]:
                     stats["rl"] += 1
                 _LIM.on_429()
                 continue
-            r.raise_for_status()
+            if r.status_code != 200:
+                with stats["lock"]:
+                    stats["errors"] += 1
+                time.sleep(2 * (i + 1))
+                continue
             el = BeautifulSoup(r.text, "html.parser").select_one("div.stock span")
             badge = el.get_text(strip=True) if el else ""
+            if not badge:
+                with stats["lock"]:
+                    stats["no_badge"] += 1
             return "No Longer Available" in badge
         except requests.RequestException:
+            with stats["lock"]:
+                stats["errors"] += 1
             time.sleep(2 * (i + 1))
-    if saw:
+    if saw_429:
         with stats["lock"]:
             stats["unresolved"].append(str(product_id))
     return False
@@ -216,7 +231,7 @@ def collect(out_dir, mode="availability"):
 
 def pull(in_dir, out_dir, shard, total, pub, workers=5, mode="availability"):
     raw = json.loads((Path(in_dir) / "ids.json").read_text())
-    stats = {"lock": threading.Lock(), "rl": 0, "unresolved": []}
+    stats = {"lock": threading.Lock(), "rl": 0, "unresolved": [], "errors": 0, "no_badge": 0}
     res = {}
     with requests.Session() as s:
         s.headers.update(_UA)
@@ -240,13 +255,25 @@ def pull(in_dir, out_dir, shard, total, pub, workers=5, mode="availability"):
     out.mkdir(parents=True, exist_ok=True)
     # The failed-id list rides inside the encrypted payload, so the public log
     # never shows which ids (or the address); only the counts are printed here.
-    obj = {"items": res, "diag": {"rl": stats["rl"], "unresolved": stats["unresolved"]}}
+    obj = {
+        "items": res,
+        "diag": {
+            "rl": stats["rl"],
+            "unresolved": stats["unresolved"],
+            "errors": stats["errors"],
+            "no_badge": stats["no_badge"],
+        },
+    }
     payload = json.dumps(obj).encode("utf-8")
     if pub:
         payload = _lock(Path(pub).read_bytes(), payload)
     p = out / ("part_%d.json" % shard)
     p.write_bytes(payload)
-    print("part", shard, "done:", len(res), "ids,", stats["rl"], "backoffs,", len(stats["unresolved"]), "unresolved")
+    print(
+        "part", shard, "done:", len(res), "ids,", stats["rl"], "backoffs,",
+        len(stats["unresolved"]), "unresolved,", stats["errors"], "errors,",
+        stats["no_badge"], "no-badge",
+    )
 
 
 if __name__ == "__main__":
