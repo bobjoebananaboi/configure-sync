@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import requests
+from bs4 import BeautifulSoup
 
 _H = "aHR0cHM6Ly93d3cud29ydGhpbmd0b25hZ3BhcnRzLmNvbS5hdQ=="
 _BASE = base64.b64decode(_H).decode()
@@ -111,7 +112,7 @@ def _groups(sess):
 
 
 def _page(sess, cid, pg):
-    q = '{ products(filter:{category_id:{eq:"%s"}},pageSize:%d,currentPage:%d){page_info{total_pages} items{sku stock_status}} }' % (cid, _PAGE, pg)
+    q = '{ products(filter:{category_id:{eq:"%s"}},pageSize:%d,currentPage:%d){page_info{total_pages} items{id sku stock_status}} }' % (cid, _PAGE, pg)
     return _post(sess, q)["products"]
 
 
@@ -144,6 +145,36 @@ def _one(sess, key, stats):
     return {}
 
 
+def _one_nla(sess, product_id, stats):
+    """Fetch a product's view-by-id page and report whether its stock badge
+    reads "No Longer Available" (mirrors the local scraper's fetch_stock_badge,
+    but boolean-only since only positives are worth shipping back)."""
+    url = _BASE + "/catalog/product/view/id/" + str(product_id)
+    saw = False
+    for i in range(3):
+        try:
+            _LIM.take()
+            r = sess.get(url, timeout=30)
+            if r.status_code == 404:
+                return False
+            if r.status_code == 429:
+                saw = True
+                with stats["lock"]:
+                    stats["rl"] += 1
+                _LIM.on_429()
+                continue
+            r.raise_for_status()
+            el = BeautifulSoup(r.text, "html.parser").select_one("div.stock span")
+            badge = el.get_text(strip=True) if el else ""
+            return "No Longer Available" in badge
+        except requests.RequestException:
+            time.sleep(2 * (i + 1))
+    if saw:
+        with stats["lock"]:
+            stats["unresolved"].append(str(product_id))
+    return False
+
+
 def _lock(pub_pem, data):
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import padding
@@ -156,10 +187,14 @@ def _lock(pub_pem, data):
     return json.dumps({"v": 1, "key": base64.b64encode(wk).decode("ascii"), "data": base64.b64encode(tok).decode("ascii")}).encode("utf-8")
 
 
-def collect(out_dir):
+def collect(out_dir, mode="availability"):
+    """mode "availability": ids.json = sorted in-stock skus (existing behavior).
+    mode "nla": ids.json = sorted [sku, id] pairs for currently out-of-stock
+    products (the HTML pass needs the numeric id, not the sku, for its URL)."""
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    ids = set()
+    in_stock = set()
+    oos = {}
     with requests.Session() as s:
         s.headers.update(_UA)
         for cid in _groups(s):
@@ -168,23 +203,39 @@ def collect(out_dir):
             for pd in pages:
                 for it in pd["items"]:
                     if it.get("stock_status") == "IN_STOCK":
-                        ids.add(it["sku"])
-    (out / "ids.json").write_text(json.dumps(sorted(ids)))
-    print("collected", len(ids))
+                        in_stock.add(it["sku"])
+                    elif it.get("id"):
+                        oos[it["sku"]] = it["id"]
+    if mode == "nla":
+        (out / "ids.json").write_text(json.dumps(sorted(oos.items())))
+        print("collected", len(oos), "out-of-stock product(s)")
+    else:
+        (out / "ids.json").write_text(json.dumps(sorted(in_stock)))
+        print("collected", len(in_stock))
 
 
-def pull(in_dir, out_dir, shard, total, pub, workers=5):
-    ids = json.loads((Path(in_dir) / "ids.json").read_text())
-    mine = [x for x in ids if zlib.crc32(x.encode("utf-8")) % total == shard]
-    print("part", shard, "of", total, ":", len(mine))
+def pull(in_dir, out_dir, shard, total, pub, workers=5, mode="availability"):
+    raw = json.loads((Path(in_dir) / "ids.json").read_text())
     stats = {"lock": threading.Lock(), "rl": 0, "unresolved": []}
     res = {}
     with requests.Session() as s:
         s.headers.update(_UA)
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            fut = {ex.submit(_one, s, x, stats): x for x in mine}
-            for f in as_completed(fut):
-                res[fut[f]] = f.result()
+        if mode == "nla":
+            mine = [(sku, pid) for sku, pid in raw if zlib.crc32(sku.encode("utf-8")) % total == shard]
+            print("part", shard, "of", total, ":", len(mine))
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                fut = {ex.submit(_one_nla, s, pid, stats): sku for sku, pid in mine}
+                for f in as_completed(fut):
+                    sku = fut[f]
+                    if f.result():
+                        res[sku] = True
+        else:
+            mine = [x for x in raw if zlib.crc32(x.encode("utf-8")) % total == shard]
+            print("part", shard, "of", total, ":", len(mine))
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                fut = {ex.submit(_one, s, x, stats): x for x in mine}
+                for f in as_completed(fut):
+                    res[fut[f]] = f.result()
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     # The failed-id list rides inside the encrypted payload, so the public log
@@ -203,6 +254,7 @@ if __name__ == "__main__":
     sub = ap.add_subparsers(dest="stage", required=True)
     a = sub.add_parser("collect")
     a.add_argument("--out-dir", default="build")
+    a.add_argument("--mode", default="availability", choices=["availability", "nla"])
     b = sub.add_parser("pull")
     b.add_argument("--in-dir", default="build")
     b.add_argument("--out-dir", default="parts")
@@ -210,8 +262,9 @@ if __name__ == "__main__":
     b.add_argument("--total", type=int, required=True)
     b.add_argument("--key", default=None)
     b.add_argument("--workers", type=int, default=5)
+    b.add_argument("--mode", default="availability", choices=["availability", "nla"])
     args = ap.parse_args()
     if args.stage == "collect":
-        collect(args.out_dir)
+        collect(args.out_dir, mode=args.mode)
     else:
-        pull(args.in_dir, args.out_dir, args.shard, args.total, args.key, args.workers)
+        pull(args.in_dir, args.out_dir, args.shard, args.total, args.key, args.workers, mode=args.mode)

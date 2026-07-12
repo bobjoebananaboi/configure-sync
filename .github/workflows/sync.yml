@@ -9,6 +9,9 @@ on:
       skip_last_shard:
         required: false
         default: "false"
+      mode:
+        required: false
+        default: "availability"
 
 jobs:
   prepare:
@@ -20,8 +23,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install -q requests cryptography
-      - run: python fetch.py collect --out-dir build
+      - run: pip install -q requests cryptography beautifulsoup4
+      - run: python fetch.py collect --out-dir build --mode ${{ github.event.inputs.mode }}
       - uses: actions/upload-artifact@v4
         with:
           name: index
@@ -47,7 +50,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install -q requests cryptography
+      - run: pip install -q requests cryptography beautifulsoup4
       - uses: actions/download-artifact@v4
         with:
           name: index
@@ -55,7 +58,7 @@ jobs:
       - run: >
           python fetch.py pull --in-dir build --out-dir parts
           --shard ${{ matrix.shard }} --total ${{ github.event.inputs.total_shards }}
-          --key key_public.pem
+          --key key_public.pem --mode ${{ github.event.inputs.mode }}
       - uses: actions/upload-artifact@v4
         with:
           name: part-${{ matrix.shard }}
