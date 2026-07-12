@@ -104,7 +104,7 @@ def _one(sess, key, stats):
             out = {}
             for e in json.loads(r.content.decode("utf-8")) or []:
                 nm = (e.get("location") or {}).get("name") or e.get("location_name") or "Unknown"
-                out[nm] = {"status": "In Stock" if e.get("available") else "Call for Availability", "quantity": e.get("quantity")}
+                out[nm] = {"status": "In Stock" if e.get("available") else "Out of Stock", "quantity": e.get("quantity")}
             return out
         except requests.RequestException:
             time.sleep(2 * (i + 1))
