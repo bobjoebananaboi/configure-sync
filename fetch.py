@@ -30,31 +30,53 @@ _BURST = 10
 _MIN_BUDGET = 60
 _STEP = 10
 _COOLDOWN = 140.0
+# Quiet time (no 429s) that earns one step back up. Safe to climb: _BUDGET sits
+# below the ~225/window the target tolerates, so a clean IP shouldn't 429 at full
+# budget - recovery settles at the ceiling rather than oscillating.
+_RECOVER = 60.0
 
 
 class _Bucket:
     """Small-burst rate limiter with adaptive backoff (matches the local
     scraper's AdaptiveRateLimiter). Starts with a tiny burst rather than a full
-    window's worth, and on a 429 pauses everything + steps the budget down."""
+    window's worth, and on a 429 pauses everything + steps the budget down.
 
-    def __init__(self, budget, win, burst, min_budget, step, cooldown):
+    After `recover` seconds without a 429 the budget steps back UP toward its
+    starting value. That matters most here: GitHub recycles runner IPs, so a
+    fresh shard can inherit an address the target still has throttled. Without
+    recovery those first few 429s pinned the shard at the floor (~3x slower) for
+    its whole job, while its siblings finished in a fraction of the time."""
+
+    def __init__(self, budget, win, burst, min_budget, step, cooldown, recover):
         self.win = win
         self.burst = burst
         self.min_budget = min_budget
         self.step = step
         self.cooldown = cooldown
+        self.recover = recover
+        self.max_budget = budget
         self.budget = budget
         self.rate = budget / win
         self.t = float(burst)
         self.blocked_until = 0.0
         self.lock = threading.Lock()
         self.last = time.monotonic()
+        self.calm_since = time.monotonic()
+
+    def _recover(self, now):
+        """Lock held. One step back up per `recover` seconds of quiet."""
+        if self.budget >= self.max_budget or now - self.calm_since < self.recover:
+            return
+        self.budget = min(self.max_budget, self.budget + self.step)
+        self.rate = self.budget / self.win
+        self.calm_since = now
 
     def take(self):
         while True:
             with self.lock:
                 now = time.monotonic()
                 if now >= self.blocked_until:
+                    self._recover(now)
                     self.t = min(self.burst, self.t + (now - self.last) * self.rate)
                     self.last = now
                     if self.t >= 1:
@@ -73,12 +95,24 @@ class _Bucket:
             self.blocked_until = now + self.cooldown
             self.t = 0.0
             self.last = now
+            self.calm_since = now  # restart the quiet clock before recovery resumes
             self.budget = max(self.min_budget, self.budget - self.step)
             self.rate = self.budget / self.win
             return True
 
 
-_LIM = _Bucket(_BUDGET, _WIN, _BURST, _MIN_BUDGET, _STEP, _COOLDOWN)
+_LIM = _Bucket(_BUDGET, _WIN, _BURST, _MIN_BUDGET, _STEP, _COOLDOWN, _RECOVER)
+
+
+def _egress_ip(sess):
+    """This runner's public IP, for the ENCRYPTED diag only - never the public
+    log. GitHub recycles runner IPs, so a shard can inherit an address the target
+    still has rate-limited; recording it is the only way to tell that apart from
+    bad luck after the fact, or to spot two shards sharing one budget."""
+    try:
+        return sess.get("https://api.ipify.org", timeout=10).text.strip()
+    except requests.RequestException:
+        return ""
 
 
 def _post(sess, q, tries=4):
@@ -119,6 +153,9 @@ def _page(sess, cid, pg):
 
 
 def _one(sess, key, stats):
+    # Returns {} when the store answered (an empty answer means "no stock
+    # record" - a real result, not a failure), or None when the call never got
+    # through. The caller retries only the Nones.
     url = _BASE + "/rest/default/V1/availability/" + key
     saw = False
     for i in range(3):
@@ -141,10 +178,12 @@ def _one(sess, key, stats):
             return out
         except requests.RequestException:
             time.sleep(2 * (i + 1))
+        except ValueError:
+            return {}  # a 200 that isn't JSON - no data to be had by re-asking
     if saw:
         with stats["lock"]:
             stats["unresolved"].append(key)
-    return {}
+    return None
 
 
 def _one_nla(sess, product_id, stats):
@@ -251,8 +290,10 @@ def pull(in_dir, out_dir, shard, total, pub, workers=5, mode="availability"):
     raw = json.loads((Path(in_dir) / "ids.json").read_text())
     stats = {"lock": threading.Lock(), "rl": 0, "unresolved": [], "errors": 0, "no_badge": 0}
     res = {}
+    ip = ""
     with requests.Session() as s:
         s.headers.update(_UA)
+        ip = _egress_ip(s)
         if mode == "nla":
             mine = [pid for pid in raw if zlib.crc32(str(pid).encode("utf-8")) % total == shard]
             print("part", shard, "of", total, ":", len(mine))
@@ -276,6 +317,11 @@ def pull(in_dir, out_dir, shard, total, pub, workers=5, mode="availability"):
     obj = {
         "items": res,
         "diag": {
+            # ip + budget ride inside the encrypted payload so the app can tell
+            # "this shard drew a throttled/shared IP" apart from "this shard was
+            # unlucky" - the public log below still only prints counts.
+            "ip": ip,
+            "budget": _LIM.budget,
             "rl": stats["rl"],
             "unresolved": stats["unresolved"],
             "errors": stats["errors"],
