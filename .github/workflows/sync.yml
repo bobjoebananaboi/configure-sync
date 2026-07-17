@@ -12,6 +12,10 @@ on:
       mode:
         required: false
         default: "availability"
+      shards:
+        description: "Comma-separated shard indices to run (blank = all of them). Lets the app re-run only the shards a cancelled run never uploaded."
+        required: false
+        default: ""
 
 jobs:
   prepare:
@@ -43,10 +47,13 @@ jobs:
       - id: m
         env:
           TOTAL: ${{ github.event.inputs.total_shards }}
-        # Always spawn all `total_shards` work jobs - skip_last_shard only
-        # controls whether the (unused-by-the-app) merge job runs below, it
-        # does NOT reserve a shard for the caller anymore.
-        run: echo "matrix=$(python -c 'import json,os; print(json.dumps(list(range(int(os.environ["TOTAL"])))))')" >> "$GITHUB_OUTPUT"
+          ONLY: ${{ github.event.inputs.shards }}
+        # Normally spawn all `total_shards` work jobs. `shards` narrows that to a
+        # subset, so the app can re-run just the shards a cancelled/failed run
+        # never uploaded instead of redoing every one - sharding is deterministic
+        # (crc32(sku) % total), so shard N always covers the same SKUs.
+        # skip_last_shard only controls the (unused-by-the-app) merge job.
+        run: echo "matrix=$(python -c 'import json,os; only=[int(x) for x in os.environ.get("ONLY","").replace(" ","").split(",") if x]; print(json.dumps(only or list(range(int(os.environ["TOTAL"])))))')" >> "$GITHUB_OUTPUT"
 
   work:
     needs: prepare
