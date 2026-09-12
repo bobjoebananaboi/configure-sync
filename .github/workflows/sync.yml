@@ -30,6 +30,15 @@ jobs:
       - run: pip install -q requests cryptography beautifulsoup4
       - name: Crawl catalog + build SKU list
         if: ${{ github.event.inputs.mode != 'nla' }}
+        # The target secrets are read here as well as by decode-nla: in details
+        # mode the app pushes the discontinued products' ids, which the index
+        # cannot supply, and collect unions them into the target list.
+        env:
+          NLA_TARGETS_0: ${{ secrets.NLA_TARGETS_0 }}
+          NLA_TARGETS_1: ${{ secrets.NLA_TARGETS_1 }}
+          NLA_TARGETS_2: ${{ secrets.NLA_TARGETS_2 }}
+          NLA_TARGETS_3: ${{ secrets.NLA_TARGETS_3 }}
+          NLA_TARGETS_4: ${{ secrets.NLA_TARGETS_4 }}
         run: python fetch.py collect --out-dir build
       - name: Decode NLA target list from secrets
         if: ${{ github.event.inputs.mode == 'nla' }}

@@ -310,6 +310,8 @@ def _one_nla(sess, product_id, stats):
 # get them is one page fetch per product. Mirrors ATTRIBUTE_LABELS in the app's
 # own parser - this repo is standalone by design (it duplicates the rate limiter
 # for the same reason), so the two must be kept in step by hand.
+NLA_SECRET_SLOTS = 5
+
 _ATTRS = {
     "equipment type": "Equipment Type",
     "replacement parts for": "Fits Manufacturer",
@@ -483,6 +485,17 @@ def collect(out_dir):
             if total and off >= total:
                 break
             time.sleep(0.2)                     # politeness to the index provider
+    # The index only carries sellable products, so anything the app has that is NOT
+    # in it - discontinued products it still wants refreshed - cannot be discovered
+    # here. The app pushes those ids as secrets before dispatch; union them in so a
+    # single run covers both. Without this the details pass silently skipped every
+    # discontinued product, and the app then reported them as "missing shards".
+    extra = _targets_from_secrets()
+    if extra:
+        before = len(pids)
+        pids |= {str(pid) for pid in extra}
+        print("added", len(pids) - before, "app-supplied product id(s) from secrets")
+
     # ids.json: SKUs, for the stock sweep. pids.json: numeric product ids, for the
     # details mode - the view-by-id route is what its page fetch uses, and a SKU
     # alone can't address it. Both come out of the one enumeration.
@@ -491,7 +504,16 @@ def collect(out_dir):
     print("collected", len(skus), "sku(s) and", len(pids), "product id(s) of", total, "reported")
 
 
-NLA_SECRET_SLOTS = 5
+def _targets_from_secrets():
+    """The app-supplied product-id list from the NLA_TARGETS_* secrets, or []."""
+    b64 = "".join(os.environ.get(f"NLA_TARGETS_{i}", "") for i in range(NLA_SECRET_SLOTS))
+    if not b64:
+        return []
+    try:
+        return json.loads(gzip.decompress(base64.b64decode(b64)))
+    except Exception:
+        print("could not decode the app-supplied target secrets - ignoring them")
+        return []
 
 
 def decode_nla(out_dir):
