@@ -30,15 +30,21 @@ _SKIP = {"5", "3", "4", "4052"}
 _MAXC = 9500
 _PAGE = 100
 _WIN = 120.0
-_BUDGET = 190
-_BURST = 10
+_BUDGET = 150
+_BURST = 5
 _MIN_BUDGET = 60
 _STEP = 10
 _COOLDOWN = 140.0
-# Quiet time (no 429s) that earns one step back up. Safe to climb: _BUDGET sits
-# below the ~225/window the target tolerates, so a clean IP shouldn't 429 at full
-# budget - recovery settles at the ceiling rather than oscillating.
-_RECOVER = 60.0
+# Quiet time (no 429s) that earns one step back up.
+#
+# Budget lowered 190 -> 150 in September 2026. The ~225/window the target tolerates
+# was measured on the availability endpoint, which answers in a few hundred bytes;
+# the details pass asks for ~100 KB pages instead, and at 190 that drew 3.1 429s per
+# IP across 16,655 pages. Each one costs a 140 s cooldown, so ~7 min per runner was
+# spent sitting still - the pacing saved by the higher budget was less than the
+# cooldowns it caused. A smaller burst and a slower climb stop the limiter
+# repeatedly probing the ceiling and re-triggering the same backoff.
+_RECOVER = 120.0
 
 
 class _Bucket:
