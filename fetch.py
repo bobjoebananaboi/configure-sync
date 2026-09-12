@@ -178,7 +178,7 @@ def _idx_page(key, url, off, tries=4):
                 "typeOfRecords": ["KLEVU_PRODUCT"],
                 "limit": 100,
                 "offset": off,
-                "fields": ["sku"],             # the sweep only needs identifiers
+                "fields": ["sku", "id"],       # sku for the stock sweep, id for details
             },
         }],
     }
@@ -295,6 +295,122 @@ def _one_nla(sess, product_id, stats):
     return False
 
 
+# Product-page attribute rows the search index does not carry, so the only way to
+# get them is one page fetch per product. Mirrors ATTRIBUTE_LABELS in the app's
+# own parser - this repo is standalone by design (it duplicates the rate limiter
+# for the same reason), so the two must be kept in step by hand.
+_ATTRS = {
+    "equipment type": "Equipment Type",
+    "replacement parts for": "Fits Manufacturer",
+    "compatible models": "Model",
+    "cross reference numbers": "OEM Number",
+    "additional information": "Notes",
+    "core charge": "Core Charge",
+}
+
+
+def _num(v):
+    if v in (None, ""):
+        return ""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return str(v)
+    return str(int(f)) if f == int(f) else ("%.6f" % f).rstrip("0").rstrip(".")
+
+
+def _parse_details(html):
+    """The page fields, as {column: value}, plus the stock badge.
+
+    Price selectors are scoped to .product-info-main: the page also renders
+    related products, each with its own price box, and an unscoped search picks
+    those up too.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    out = {}
+    for tr in soup.select("table#product-attribute-specs-table tr, table.additional-attributes tr, "
+                          ".additional-attributes-wrapper table tr"):
+        th = tr.select_one("th")
+        td = tr.select_one("td")
+        if not (th and td):
+            continue
+        col = _ATTRS.get(th.get_text(" ", strip=True).strip().lower())
+        if not col:
+            continue
+        # Groups are separated by <br/> ("Hesston: 5820<br/>Ford: 268"); flattening
+        # them to a space runs the groups together.
+        for br in td.find_all("br"):
+            br.replace_with(" | ")
+        out[col] = td.get_text(" ", strip=True)
+
+    desc = soup.select_one(".product.attribute.description") or soup.select_one("#description")
+    if desc:
+        text = desc.get_text(" ", strip=True)
+        if text:
+            out["Description"] = text
+
+    main = soup.select_one(".product-info-main") or soup
+    for el in main.select("[data-price-type]"):
+        kind = el.get("data-price-type")
+        amount = el.get("data-price-amount")
+        if not amount:
+            continue
+        if kind == "coreChargePrice":
+            out["Core Charge"] = _num(amount)
+        elif kind == "finalPrice" and "_page_final_price" not in out:
+            out["_page_final_price"] = amount
+        elif kind == "oldPrice" and "_page_old_price" not in out:
+            out["_page_old_price"] = amount
+
+    el = soup.select_one("div.stock span")
+    if el:
+        out["_stock_badge"] = el.get_text(" ", strip=True)
+
+    if out.get("Core Charge"):
+        out["Core Charge"] = _num(re.sub(r"[^\d.]", "", str(out["Core Charge"])) or 0)
+    return out
+
+
+def _one_details(sess, pid, stats):
+    """One product's page fields, {} when the page doesn't resolve, None when the
+    fetch never got through (the caller retries only the Nones).
+
+    Uses the view-by-id route, which resolves for any live product - unlike the
+    SEO URL, which can go stale."""
+    url = _BASE + "/catalog/product/view/id/" + str(pid)
+    saw = False
+    for i in range(3):
+        try:
+            _LIM.take()
+            r = sess.get(url, timeout=30)
+            if r.status_code == 404:
+                return {}
+            if r.status_code == 429:
+                saw = True
+                with stats["lock"]:
+                    stats["rl"] += 1
+                _LIM.on_429()
+                continue
+            if r.status_code != 200:
+                with stats["lock"]:
+                    stats["errors"] += 1
+                time.sleep(2 * (i + 1))
+                continue
+            got = _parse_details(r.text)
+            if not got:
+                with stats["lock"]:
+                    stats["no_badge"] += 1
+            return got
+        except requests.RequestException:
+            with stats["lock"]:
+                stats["errors"] += 1
+            time.sleep(2 * (i + 1))
+    if saw:
+        with stats["lock"]:
+            stats["unresolved"].append(str(pid))
+    return None
+
+
 def _lock(pub_pem, data):
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import padding
@@ -328,6 +444,7 @@ def collect(out_dir):
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     skus = set()
+    pids = set()
     with requests.Session() as s:
         s.headers.update(_UA)
         key, url = _idx_cfg(s)
@@ -340,12 +457,18 @@ def collect(out_dir):
             for rec in batch:
                 if rec.get("sku"):
                     skus.add(rec["sku"])
+                if rec.get("id"):
+                    pids.add(str(rec["id"]))
             off += 100
             if total and off >= total:
                 break
             time.sleep(0.2)                     # politeness to the index provider
+    # ids.json: SKUs, for the stock sweep. pids.json: numeric product ids, for the
+    # details mode - the view-by-id route is what its page fetch uses, and a SKU
+    # alone can't address it. Both come out of the one enumeration.
     (out / "ids.json").write_text(json.dumps(sorted(skus)))
-    print("collected", len(skus), "of", total, "reported")
+    (out / "pids.json").write_text(json.dumps(sorted(pids, key=int)))
+    print("collected", len(skus), "sku(s) and", len(pids), "product id(s) of", total, "reported")
 
 
 NLA_SECRET_SLOTS = 5
@@ -365,14 +488,26 @@ def decode_nla(out_dir):
 
 
 def pull(in_dir, out_dir, shard, total, pub, workers=5, mode="availability"):
-    raw = json.loads((Path(in_dir) / "ids.json").read_text())
+    # details mode shards the numeric product ids (its page fetch is addressed by
+    # id); the other modes shard SKUs / the decoded target list in ids.json.
+    target_file = "pids.json" if mode == "details" else "ids.json"
+    raw = json.loads((Path(in_dir) / target_file).read_text())
     stats = {"lock": threading.Lock(), "rl": 0, "unresolved": [], "errors": 0, "no_badge": 0}
     res = {}
     ip = ""
     with requests.Session() as s:
         s.headers.update(_UA)
         ip = _egress_ip(s)
-        if mode == "nla":
+        if mode == "details":
+            mine = [pid for pid in raw if zlib.crc32(str(pid).encode("utf-8")) % total == shard]
+            print("part", shard, "of", total, ":", len(mine))
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                fut = {ex.submit(_one_details, s, pid, stats): pid for pid in sorted(mine, key=int)}
+                for f in as_completed(fut):
+                    got = f.result()
+                    if got is not None:
+                        res[str(fut[f])] = got
+        elif mode == "nla":
             mine = [pid for pid in raw if zlib.crc32(str(pid).encode("utf-8")) % total == shard]
             print("part", shard, "of", total, ":", len(mine))
             with ThreadPoolExecutor(max_workers=workers) as ex:
@@ -432,7 +567,7 @@ if __name__ == "__main__":
     b.add_argument("--total", type=int, required=True)
     b.add_argument("--key", default=None)
     b.add_argument("--workers", type=int, default=5)
-    b.add_argument("--mode", default="availability", choices=["availability", "nla"])
+    b.add_argument("--mode", default="availability", choices=["availability", "nla", "details"])
     args = ap.parse_args()
     if args.stage == "collect":
         collect(args.out_dir)
