@@ -232,6 +232,7 @@ def _one(sess, key, stats):
                 saw = True
                 with stats["lock"]:
                     stats["rl"] += 1
+                _note_code(stats, 429)
                 _LIM.on_429()
                 continue
             r.raise_for_status()
@@ -240,7 +241,14 @@ def _one(sess, key, stats):
                 nm = (e.get("location") or {}).get("name") or e.get("location_name") or "Unknown"
                 out[nm] = {"status": "In Stock" if e.get("available") else "Call for Availability", "quantity": e.get("quantity")}
             return out
-        except requests.RequestException:
+        except requests.RequestException as e:
+            # raise_for_status turns a 5xx into an HTTPError, so pull the status
+            # back off it - otherwise an overloaded target looked identical to a
+            # network blip, and neither was recorded at all.
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            with stats["lock"]:
+                stats["errors"] += 1
+            _note_code(stats, status or type(e).__name__)
             time.sleep(2 * (i + 1))
         except ValueError:
             return {}  # a 200 that isn't JSON - no data to be had by re-asking
@@ -277,6 +285,7 @@ def _one_nla(sess, product_id, stats):
             if r.status_code != 200:
                 with stats["lock"]:
                     stats["errors"] += 1
+                _note_code(stats, r.status_code)
                 time.sleep(2 * (i + 1))
                 continue
             el = BeautifulSoup(r.text, "html.parser").select_one("div.stock span")
@@ -285,9 +294,11 @@ def _one_nla(sess, product_id, stats):
                 with stats["lock"]:
                     stats["no_badge"] += 1
             return "No Longer Available" in badge
-        except requests.RequestException:
+        except requests.RequestException as e:
+            status = getattr(getattr(e, "response", None), "status_code", None)
             with stats["lock"]:
                 stats["errors"] += 1
+            _note_code(stats, status or type(e).__name__)
             time.sleep(2 * (i + 1))
     if saw_429:
         with stats["lock"]:
@@ -307,6 +318,11 @@ _ATTRS = {
     "additional information": "Notes",
     "core charge": "Core Charge",
 }
+
+
+def _note_code(stats, code):
+    with stats["lock"]:
+        stats["codes"][str(code)] = stats["codes"].get(str(code), 0) + 1
 
 
 def _num(v):
@@ -389,11 +405,13 @@ def _one_details(sess, pid, stats):
                 saw = True
                 with stats["lock"]:
                     stats["rl"] += 1
+                _note_code(stats, 429)
                 _LIM.on_429()
                 continue
             if r.status_code != 200:
                 with stats["lock"]:
                     stats["errors"] += 1
+                _note_code(stats, r.status_code)
                 time.sleep(2 * (i + 1))
                 continue
             got = _parse_details(r.text)
@@ -401,9 +419,11 @@ def _one_details(sess, pid, stats):
                 with stats["lock"]:
                     stats["no_badge"] += 1
             return got
-        except requests.RequestException:
+        except requests.RequestException as e:
+            status = getattr(getattr(e, "response", None), "status_code", None)
             with stats["lock"]:
                 stats["errors"] += 1
+            _note_code(stats, status or type(e).__name__)
             time.sleep(2 * (i + 1))
     if saw:
         with stats["lock"]:
@@ -492,7 +512,13 @@ def pull(in_dir, out_dir, shard, total, pub, workers=5, mode="availability"):
     # id); the other modes shard SKUs / the decoded target list in ids.json.
     target_file = "pids.json" if mode == "details" else "ids.json"
     raw = json.loads((Path(in_dir) / target_file).read_text())
-    stats = {"lock": threading.Lock(), "rl": 0, "unresolved": [], "errors": 0, "no_badge": 0}
+    # codes: what the target actually answered, so the app can tell "it is
+    # overloaded" (503/502/504) from "this IP is blocked" (403, or connection
+    # timeouts that never answer at all) from plain rate limiting (429). Without
+    # this they all collapsed into one "errors" number, which says nothing about
+    # whether to back off, change IPs, or wait.
+    stats = {"lock": threading.Lock(), "rl": 0, "unresolved": [], "errors": 0,
+             "no_badge": 0, "codes": {}}
     res = {}
     ip = ""
     with requests.Session() as s:
@@ -539,6 +565,7 @@ def pull(in_dir, out_dir, shard, total, pub, workers=5, mode="availability"):
             "unresolved": stats["unresolved"],
             "errors": stats["errors"],
             "no_badge": stats["no_badge"],
+            "codes": stats["codes"],
         },
     }
     payload = json.dumps(obj).encode("utf-8")
@@ -551,6 +578,11 @@ def pull(in_dir, out_dir, shard, total, pub, workers=5, mode="availability"):
         len(stats["unresolved"]), "unresolved,", stats["errors"], "errors,",
         stats["no_badge"], "no-badge",
     )
+    if stats["codes"]:
+        # Status codes only - no ids, no address - so this is safe in a public log
+        # and visible straight from the Actions tab without decrypting anything.
+        print("part", shard, "responses:",
+              ", ".join(f"{code} x{n}" for code, n in sorted(stats["codes"].items())))
 
 
 if __name__ == "__main__":
