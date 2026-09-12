@@ -3,6 +3,7 @@ import base64
 import gzip
 import json
 import os
+import re
 import threading
 import time
 import zlib
@@ -14,6 +15,10 @@ from bs4 import BeautifulSoup
 
 _H = "aHR0cHM6Ly93d3cud29ydGhpbmd0b25hZ3BhcnRzLmNvbS5hdQ=="
 _BASE = base64.b64decode(_H).decode()
+# The structured API the crawl used until September 2026, when the target started
+# returning 403 at the edge for every request to it - any path casing, any method,
+# any headers, from any IP. _post/_groups/_page below are kept for if that is ever
+# lifted; collect() now builds the list from the search index instead.
 _GQL = _BASE + "/graphql"
 _UA = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:135.0) Gecko/20100101 Firefox/135.0",
@@ -136,6 +141,65 @@ def _post(sess, q, tries=4):
     raise RuntimeError(err)
 
 
+def _idx_cfg(sess):
+    """The storefront's public search-index key and cluster, read from its HTML
+    at run time.
+
+    Deliberately not a constant: the key is public (every browser that loads the
+    page receives it) but it can be rotated, and a stale hardcoded copy would
+    fail silently mid-run. Reading it also keeps it out of this repo.
+    """
+    _LIM.take()
+    r = sess.get(_BASE, timeout=30)
+    r.raise_for_status()
+    html = r.text
+    key = re.search(r"[\"'](klevu-\d{10,})[\"']", html)
+    if not key:
+        raise RuntimeError("search-index key not present in storefront HTML")
+    cluster = re.search(r"([a-z]+cs\d+v\d+)\.ksearchnet\.com", html)
+    host = cluster.group(1) if cluster else "eucs31v2"
+    return key.group(1), "https://%s.ksearchnet.com/cs/v2/search" % host
+
+
+def _idx_page(key, url, off, tries=4):
+    """One page of the search index. `apiKeys` must be a LIST - the singular
+    `apiKey` form returns HTTP 500. `limit` is capped server-side at 100.
+
+    These requests go to the index provider, not the target, so they spend none
+    of this runner's per-IP budget and are not paced by _LIM.
+    """
+    body = {
+        "context": {"apiKeys": [key]},
+        "recordQueries": [{
+            "id": "productList",
+            "typeOfRequest": "SEARCH",
+            "settings": {
+                "query": {"term": "*"},        # matches the entire index
+                "typeOfRecords": ["KLEVU_PRODUCT"],
+                "limit": 100,
+                "offset": off,
+                "fields": ["sku"],             # the sweep only needs identifiers
+            },
+        }],
+    }
+    err = None
+    for i in range(tries):
+        try:
+            r = requests.post(url, json=body, headers={
+                "User-Agent": _UA["User-Agent"],
+                "Content-Type": "application/json",
+                "Origin": _BASE,
+                "Referer": _BASE + "/",
+            }, timeout=60)
+            r.raise_for_status()
+            res = (r.json().get("queryResults") or [{}])[0]
+            return res.get("records") or [], (res.get("meta") or {}).get("totalResultsFound")
+        except (requests.RequestException, ValueError, KeyError) as e:
+            err = e
+            time.sleep(2 * (i + 1))
+    raise RuntimeError("search index failed at offset %d: %s" % (off, err))
+
+
 def _groups(sess):
     q = '{ products(filter:{category_id:{eq:"%s"}},pageSize:1,currentPage:1){aggregations{attribute_code options{value count}}} }' % _ROOT
     d = _post(sess, q)
@@ -244,30 +308,44 @@ def _lock(pub_pem, data):
 
 
 def collect(out_dir):
-    """Crawl the catalog and write the in-stock SKU list (availability mode
-    only). NOT usable to discover an "out-of-stock" list: Magento's category
-    browse only ever returns sellable (stock_status IN_STOCK) items - live
-    testing found 100% of ~29k sampled catalog items came back IN_STOCK, with
-    zero exceptions. The real "Out of Stock" state only exists after the
-    per-location availability sweep finds zero quantity everywhere (see
-    compute_stock_status in the site scraper's stock-status module), so it can't be
-    rediscovered by a fresh crawl - the NLA pass instead gets its target list
-    handed to it via decode_nla(), sourced from the app's own already-computed
-    CSV."""
+    """Write the sellable SKU list (availability mode only), from the search
+    index rather than the old category crawl.
+
+    Still NOT usable to discover an "out-of-stock" list: the index carries only
+    sellable products, exactly as the category browse did - live testing found
+    100% of ~29k sampled catalog items came back IN_STOCK, with zero exceptions.
+    The real "Out of Stock" state only exists after the per-location availability
+    sweep finds zero quantity everywhere, so it can't be rediscovered by a fresh
+    crawl - the NLA pass instead gets its target list handed to it via
+    decode_nla(), sourced from the app's own already-computed CSV.
+
+    Two things improve over the category crawl this replaces. It sees products
+    whose only category is the top-level umbrella, which the crawl had to skip as
+    too large to paginate (~2,300 of them). And it costs this runner nothing: the
+    requests go to the index provider, not the target, so the whole list arrives
+    in ~130 requests without touching the per-IP budget the sweep needs.
+    """
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    in_stock = set()
+    skus = set()
     with requests.Session() as s:
         s.headers.update(_UA)
-        for cid in _groups(s):
-            first = _page(s, cid, 1)
-            pages = [first] + [_page(s, cid, p) for p in range(2, first["page_info"]["total_pages"] + 1)]
-            for pd in pages:
-                for it in pd["items"]:
-                    if it.get("stock_status") == "IN_STOCK":
-                        in_stock.add(it["sku"])
-    (out / "ids.json").write_text(json.dumps(sorted(in_stock)))
-    print("collected", len(in_stock))
+        key, url = _idx_cfg(s)
+        off = 0
+        total = None
+        while off < 60000:                      # runaway guard; real stop is `total`
+            batch, total = _idx_page(key, url, off)
+            if not batch:
+                break
+            for rec in batch:
+                if rec.get("sku"):
+                    skus.add(rec["sku"])
+            off += 100
+            if total and off >= total:
+                break
+            time.sleep(0.2)                     # politeness to the index provider
+    (out / "ids.json").write_text(json.dumps(sorted(skus)))
+    print("collected", len(skus), "of", total, "reported")
 
 
 NLA_SECRET_SLOTS = 5
