@@ -154,10 +154,23 @@ def _idx_cfg(sess):
     Deliberately not a constant: the key is public (every browser that loads the
     page receives it) but it can be rotated, and a stale hardcoded copy would
     fail silently mid-run. Reading it also keeps it out of this repo.
+
+    Retried with backoff: this one request gates the whole run, and a single 503
+    or timeout here used to fail `prepare` in seconds and take every shard with it.
     """
-    _LIM.take()
-    r = sess.get(_BASE, timeout=30)
-    r.raise_for_status()
+    err = None
+    for i in range(5):
+        try:
+            _LIM.take()
+            r = sess.get(_BASE, timeout=30)
+            r.raise_for_status()
+            break
+        except requests.RequestException as e:
+            err = e
+            print("  storefront fetch failed (%s), retrying" % e)
+            time.sleep(15 * (i + 1))
+    else:
+        raise RuntimeError("storefront unreachable: %s" % err)
     html = r.text
     key = re.search(r"[\"'](klevu-\d{10,})[\"']", html)
     if not key:
