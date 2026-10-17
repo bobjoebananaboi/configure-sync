@@ -45,6 +45,13 @@ _COOLDOWN = 140.0
 # cooldowns it caused. A smaller burst and a slower climb stop the limiter
 # repeatedly probing the ceiling and re-triggering the same backoff.
 _RECOVER = 120.0
+# Wall-clock cap on one GET, body included. requests' `timeout` only bounds each
+# socket read, so a server that keeps dribbling bytes never trips it - and once all
+# five workers were parked on such a call, a shard sat silent for 50+ minutes with
+# nothing in its log. Generous next to a normal answer (well under a second).
+_DEADLINE = 60.0
+# Progress line every this many keys, so a slow shard is visible in the live log.
+_BEAT = 250
 
 
 class _Bucket:
@@ -124,6 +131,36 @@ def _egress_ip(sess):
         return sess.get("https://api.ipify.org", timeout=10).text.strip()
     except requests.RequestException:
         return ""
+
+
+def _get(sess, url, timeout):
+    """sess.get, but the whole response must arrive within _DEADLINE seconds or it
+    raises ReadTimeout like any other stalled call (and is retried as one)."""
+    deadline = time.monotonic() + _DEADLINE
+    r = sess.get(url, timeout=timeout, stream=True)
+    try:
+        body = bytearray()
+        # read1, not iter_content: iter_content(n) blocks until it has n bytes, so a
+        # trickle never got back to the deadline check. read1 returns what's there.
+        while True:
+            chunk = r.raw.read1(65536, decode_content=True)
+            if not chunk:
+                break
+            body += chunk
+            if time.monotonic() > deadline:
+                raise requests.exceptions.ReadTimeout("no full answer within %ds" % _DEADLINE)
+        r._content = bytes(body)
+    finally:
+        r.close()
+    return r
+
+
+def _beat(shard, done, total, stats, start):
+    # Counts only - no ids, no address - so this is safe in a public log.
+    if done % _BEAT and done != total:
+        return
+    print("part", shard, "progress: %d/%d" % (done, total), "in %ds," % (time.time() - start),
+          stats["rl"], "backoffs,", stats["errors"], "errors, budget", _LIM.budget, flush=True)
 
 
 def _post(sess, q, tries=4):
@@ -244,7 +281,7 @@ def _one(sess, key, stats):
     for i in range(3):
         try:
             _LIM.take()
-            r = sess.get(url, timeout=15)
+            r = _get(sess, url, 15)
             if r.status_code == 404:
                 return {}
             if r.status_code == 429:
@@ -292,7 +329,7 @@ def _one_nla(sess, product_id, stats):
     for i in range(3):
         try:
             _LIM.take()
-            r = sess.get(url, timeout=30)
+            r = _get(sess, url, 30)
             if r.status_code == 404:
                 return False
             if r.status_code == 429:
@@ -419,7 +456,7 @@ def _one_details(sess, pid, stats):
     for i in range(3):
         try:
             _LIM.take()
-            r = sess.get(url, timeout=30)
+            r = _get(sess, url, 30)
             if r.status_code == 404:
                 return {}
             if r.status_code == 429:
@@ -562,6 +599,7 @@ def pull(in_dir, out_dir, shard, total, pub, workers=5, mode="availability"):
              "no_badge": 0, "codes": {}}
     res = {}
     ip = ""
+    start = time.time()
     with requests.Session() as s:
         s.headers.update(_UA)
         ip = _egress_ip(s)
@@ -570,26 +608,29 @@ def pull(in_dir, out_dir, shard, total, pub, workers=5, mode="availability"):
             print("part", shard, "of", total, ":", len(mine))
             with ThreadPoolExecutor(max_workers=workers) as ex:
                 fut = {ex.submit(_one_details, s, pid, stats): pid for pid in sorted(mine, key=int)}
-                for f in as_completed(fut):
+                for n, f in enumerate(as_completed(fut), 1):
                     got = f.result()
                     if got is not None:
                         res[str(fut[f])] = got
+                    _beat(shard, n, len(mine), stats, start)
         elif mode == "nla":
             mine = [pid for pid in raw if zlib.crc32(str(pid).encode("utf-8")) % total == shard]
             print("part", shard, "of", total, ":", len(mine))
             with ThreadPoolExecutor(max_workers=workers) as ex:
                 fut = {ex.submit(_one_nla, s, pid, stats): pid for pid in mine}
-                for f in as_completed(fut):
+                for n, f in enumerate(as_completed(fut), 1):
                     pid = fut[f]
                     if f.result():
                         res[str(pid)] = True
+                    _beat(shard, n, len(mine), stats, start)
         else:
             mine = [x for x in raw if zlib.crc32(x.encode("utf-8")) % total == shard]
             print("part", shard, "of", total, ":", len(mine))
             with ThreadPoolExecutor(max_workers=workers) as ex:
                 fut = {ex.submit(_one, s, x, stats): x for x in mine}
-                for f in as_completed(fut):
+                for n, f in enumerate(as_completed(fut), 1):
                     res[fut[f]] = f.result()
+                    _beat(shard, n, len(mine), stats, start)
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     # The failed-id list rides inside the encrypted payload, so the public log

@@ -67,6 +67,11 @@ jobs:
   work:
     needs: prepare
     runs-on: ubuntu-latest
+    # Backstop for a shard that wedges: without it GitHub lets a job run for 6 hours.
+    # Sized for the page pass on few shards (~16k pages / 4 runners is ~55 min); the
+    # app cuts ordinary stragglers far sooner. A killed shard uploads nothing, so the
+    # app sees it as missing and re-runs it on fresh runners.
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       max-parallel: 20
