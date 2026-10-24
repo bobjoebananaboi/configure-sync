@@ -501,7 +501,7 @@ def _lock(pub_pem, data):
     return json.dumps({"v": 1, "key": base64.b64encode(wk).decode("ascii"), "data": base64.b64encode(tok).decode("ascii")}).encode("utf-8")
 
 
-def collect(out_dir):
+def collect(out_dir, targets_only=False):
     """Write the sellable SKU list (availability mode only), from the search
     index rather than the old category crawl.
 
@@ -521,6 +521,18 @@ def collect(out_dir):
     """
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
+    if targets_only:
+        # A retry or resume of the details pass: the app hands over exactly the ids
+        # it still lacks. Unioning them with the index (below) made every runner
+        # refetch its whole slice of the catalog - 224 missing pages turned into an
+        # ~11,000-page, 35-minute rerun.
+        pids = {str(pid) for pid in _targets_from_secrets()}
+        if not pids:
+            raise SystemExit("--targets-only, but the target secrets are empty or unreadable")
+        (out / "ids.json").write_text("[]")
+        (out / "pids.json").write_text(json.dumps(sorted(pids, key=int)))
+        print("collected", len(pids), "app-supplied product id(s) only (targets-only)")
+        return
     skus = set()
     pids = set()
     with requests.Session() as s:
@@ -672,6 +684,7 @@ if __name__ == "__main__":
     sub = ap.add_subparsers(dest="stage", required=True)
     a = sub.add_parser("collect")
     a.add_argument("--out-dir", default="build")
+    a.add_argument("--targets-only", action="store_true")
     c = sub.add_parser("decode-nla")
     c.add_argument("--out-dir", default="build")
     b = sub.add_parser("pull")
@@ -684,7 +697,7 @@ if __name__ == "__main__":
     b.add_argument("--mode", default="availability", choices=["availability", "nla", "details"])
     args = ap.parse_args()
     if args.stage == "collect":
-        collect(args.out_dir)
+        collect(args.out_dir, targets_only=args.targets_only)
     elif args.stage == "decode-nla":
         decode_nla(args.out_dir)
     else:

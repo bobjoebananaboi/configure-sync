@@ -16,6 +16,10 @@ on:
         description: "Comma-separated shard indices to run (blank = all of them). Lets the app re-run only the shards a cancelled run never uploaded."
         required: false
         default: ""
+      targets_only:
+        description: "details mode: fetch only the app-supplied ids in the target secrets, not the whole index. Used by retries and resumes."
+        required: false
+        default: "false"
 
 jobs:
   prepare:
@@ -39,7 +43,8 @@ jobs:
           NLA_TARGETS_2: ${{ secrets.NLA_TARGETS_2 }}
           NLA_TARGETS_3: ${{ secrets.NLA_TARGETS_3 }}
           NLA_TARGETS_4: ${{ secrets.NLA_TARGETS_4 }}
-        run: python fetch.py collect --out-dir build
+          TARGETS_ONLY: ${{ github.event.inputs.targets_only }}
+        run: python fetch.py collect --out-dir build $([ "$TARGETS_ONLY" = "true" ] && echo --targets-only)
       - name: Decode NLA target list from secrets
         if: ${{ github.event.inputs.mode == 'nla' }}
         env:
