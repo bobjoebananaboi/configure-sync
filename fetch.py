@@ -52,6 +52,9 @@ _RECOVER = 120.0
 _DEADLINE = 60.0
 # Progress line every this many keys, so a slow shard is visible in the live log.
 _BEAT = 250
+# Marker file collect leaves beside pids.json when the ids are to be dealt out
+# evenly by position instead of by hash (see collect's targets_only branch).
+_EVEN = "even_split"
 
 
 class _Bucket:
@@ -150,9 +153,31 @@ def _get(sess, url, timeout):
             if time.monotonic() > deadline:
                 raise requests.exceptions.ReadTimeout("no full answer within %ds" % _DEADLINE)
         r._content = bytes(body)
+    except requests.RequestException:
+        raise
+    except Exception as e:
+        # Reading r.raw directly bypasses the wrapping requests does for its own
+        # body reads, so a connection dropped mid-body arrives as a bare urllib3 /
+        # socket error. Callers only retry RequestException; anything else escaped
+        # the worker and killed the whole part at the very end, with nothing saved.
+        raise requests.exceptions.ConnectionError("%s mid-body" % type(e).__name__) from e
     finally:
         r.close()
     return r
+
+
+def _result(f, stats, failed):
+    """A worker's result, or `failed` if it raised. One page that cannot be
+    fetched or parsed must cost that page, not every page the part already has.
+    The error type is logged (no id, no address), so the cause is in the log."""
+    try:
+        return f.result()
+    except Exception as e:
+        with stats["lock"]:
+            stats["errors"] += 1
+        _note_code(stats, type(e).__name__)
+        print("  worker error:", type(e).__name__, flush=True)
+        return failed
 
 
 def _beat(shard, done, total, stats, start):
@@ -531,6 +556,11 @@ def collect(out_dir, targets_only=False):
             raise SystemExit("--targets-only, but the target secrets are empty or unreadable")
         (out / "ids.json").write_text("[]")
         (out / "pids.json").write_text(json.dumps(sorted(pids, key=int)))
+        # Tells pull to deal these out round-robin rather than by hash. The ids a
+        # retry is missing are usually whole parts that failed, so they all hash to
+        # the same few parts again: 3,765 ids "across 7 runners" went to 2 of them
+        # while the other 5 exited with nothing to do.
+        (out / _EVEN).write_text("1")
         print("collected", len(pids), "app-supplied product id(s) only (targets-only)")
         return
     skus = set()
@@ -616,12 +646,15 @@ def pull(in_dir, out_dir, shard, total, pub, workers=5, mode="availability"):
         s.headers.update(_UA)
         ip = _egress_ip(s)
         if mode == "details":
-            mine = [pid for pid in raw if zlib.crc32(str(pid).encode("utf-8")) % total == shard]
+            if (Path(in_dir) / _EVEN).exists():
+                mine = sorted({str(pid) for pid in raw}, key=int)[shard::total]
+            else:
+                mine = [pid for pid in raw if zlib.crc32(str(pid).encode("utf-8")) % total == shard]
             print("part", shard, "of", total, ":", len(mine))
             with ThreadPoolExecutor(max_workers=workers) as ex:
                 fut = {ex.submit(_one_details, s, pid, stats): pid for pid in sorted(mine, key=int)}
                 for n, f in enumerate(as_completed(fut), 1):
-                    got = f.result()
+                    got = _result(f, stats, None)
                     if got is not None:
                         res[str(fut[f])] = got
                     _beat(shard, n, len(mine), stats, start)
@@ -632,7 +665,7 @@ def pull(in_dir, out_dir, shard, total, pub, workers=5, mode="availability"):
                 fut = {ex.submit(_one_nla, s, pid, stats): pid for pid in mine}
                 for n, f in enumerate(as_completed(fut), 1):
                     pid = fut[f]
-                    if f.result():
+                    if _result(f, stats, False):
                         res[str(pid)] = True
                     _beat(shard, n, len(mine), stats, start)
         else:
@@ -641,7 +674,7 @@ def pull(in_dir, out_dir, shard, total, pub, workers=5, mode="availability"):
             with ThreadPoolExecutor(max_workers=workers) as ex:
                 fut = {ex.submit(_one, s, x, stats): x for x in mine}
                 for n, f in enumerate(as_completed(fut), 1):
-                    res[fut[f]] = f.result()
+                    res[fut[f]] = _result(f, stats, None)
                     _beat(shard, n, len(mine), stats, start)
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
